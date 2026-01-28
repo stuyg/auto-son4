@@ -1,156 +1,201 @@
+import os
+import gc
 import h5py
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from spektral.layers import GCNConv, GlobalSumPool
-from scipy.spatial.distance import cdist
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
 
-# ==========================================
-# 1. 内存安全的数据生成器
-# ==========================================
-class RadioGraphGenerator:
-    def __init__(self, h5_path, batch_size=32, num_users=15, antennas_per_user=15):
-        self.h5_path = h5_path
-        self.batch_size = batch_size
-        self.num_users = num_users
-        self.antennas_per_user = antennas_per_user
-        self.num_nodes = num_users * antennas_per_user  # 225
-        
-        # 预先构建拓扑结构 (邻接矩阵 A) [cite: 201-202]
-        self.A_matrix = self._build_topology()
-        
-        # 获取 QPSK 索引 (只读标签，不占内存)
-        print("正在扫描数据集索引 (这可能需要几秒钟)...")
-        self.h1_indices = self._get_qpsk_indices()
-        print(f"找到 QPSK (H1) 样本数: {len(self.h1_indices)}")
-        
-    def _build_topology(self, area_size=100, rho=10.0):
-        """构建 15x15 的空间位置并计算邻接矩阵 A"""
-        positions = []
-        user_centers = np.random.rand(self.num_users, 2) * area_size
-        for center in user_centers:
-            # 模拟用户周围的天线簇
-            antennas = center + np.random.randn(self.antennas_per_user, 2) * 0.5
-            positions.extend(antennas)
-        positions = np.array(positions)
-        # 计算距离并应用 RBF 核 [cite: 202]
-        dist_matrix = cdist(positions, positions, metric='euclidean')
-        A = np.exp(-(dist_matrix**2) / (rho**2))
-        return A
+# 导入自定义模型
+from model import GCN_CSS, CNN_CSS, MLP_CSS 
 
-    def _get_qpsk_indices(self):
-        """只读取标签 Y，定位 QPSK 数据的位置"""
-        # RadioML 2018.01A 类别顺序
-        classes = ['OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK',
-                   '16APSK', '32APSK', '64APSK', '128APSK', '16QAM', '32QAM', '64QAM',
-                   '128QAM', '256QAM', 'AM-SSB-WC', 'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC',
-                   'FM', 'GMSK', 'OQPSK']
-        target_idx = classes.index('QPSK')
+# ================= 配置区域 =================
+HDF5_PATH = '/root/autodl-tmp/radioml2018/GCN_CSS/GOLD_XYZ_OSC.0001_1024.hdf5' 
+BATCH_SIZE = 32  
+NUM_NODES = 32
+TARGET_PFA = 0.1 
+SAMPLES_PER_SNR = 100 # 恢复采样数，保证曲线平滑
+
+# 强制使用 CPU (避免 GPU OOM，虽然慢点但稳)
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
+MODELS = [
+    {'name': 'GCN-CSS (Proposed)', 'class': GCN_CSS, 'path': 'best_gcn_model.h5', 'color': 'red', 'marker': 'o', 'type': 'gcn'},
+    {'name': 'CNN', 'class': CNN_CSS, 'path': 'best_cnn_model.h5', 'color': 'blue', 'marker': 's', 'type': 'other'},
+    {'name': 'MLP', 'class': MLP_CSS, 'path': 'best_mlp_model.h5', 'color': 'green', 'marker': '^', 'type': 'other'},
+]
+
+# ================= 数据加载 (修复版) =================
+def load_random_test_data(hdf5_path, samples_per_snr=100):
+    print(f"🚀 正在加载测试数据 (每SNR采样: {samples_per_snr})...")
+    with h5py.File(hdf5_path, 'r') as f:
+        Z_all = f['Z'][:]
+        unique_snrs = np.unique(Z_all)
         
-        with h5py.File(self.h5_path, 'r') as f:
-            # 这里的 argmax 可能也会耗内存，如果只有 8G 内存，建议分块读取
-            # 这里假设机器能存下标签数组 (约几百MB)
-            y = np.argmax(f['Y'][:], axis=1)
-            indices = np.where(y == target_idx)[0]
-        return indices
-
-    def _calculate_energy(self, iq_samples):
-        """能量检测: (Batch, 1024, 2) -> (Batch, 1) [cite: 152]"""
-        return np.mean(np.sum(iq_samples**2, axis=2), axis=1, keepdims=True)
-
-    def generator(self):
-        """
-        核心生成器：无限循环，每次只读 1 个 batch 的数据
-        """
-        with h5py.File(self.h5_path, 'r') as f:
-            X_ds = f['X'] # 获取句柄，不加载数据
+        selected_indices = []
+        np.random.seed(2024)
+        for snr in unique_snrs:
+            indices = np.where(Z_all == snr)[0]
+            if len(indices) > samples_per_snr:
+                chosen = np.random.choice(indices, samples_per_snr, replace=False)
+            else:
+                chosen = indices
+            selected_indices.extend(chosen)
+        selected_indices = np.sort(np.array(selected_indices))
+        
+        # 分块读取 X
+        X_chunks = []
+        chunk_size = 2000 
+        for i in range(0, len(selected_indices), chunk_size):
+            subset = selected_indices[i : i + chunk_size]
+            X_chunks.append(f['X'][subset])
+        
+        X_sig = np.concatenate(X_chunks, axis=0)
+        Z_sig = Z_all[selected_indices]
+        
+        # 【关键修正】: 准确估算底噪 (Noise Floor)
+        # 使用 -20dB 的信号作为底噪参考 (此时信号淹没在噪声中，接近纯噪声)
+        noise_floor_indices = np.where(Z_all == -20)[0]
+        if len(noise_floor_indices) == 0:
+            # 如果没有 -20dB，找最小的那个 SNR
+            min_snr = np.min(Z_all)
+            noise_floor_indices = np.where(Z_all == min_snr)[0]
+            print(f"⚠️ 未找到 -20dB 数据，使用 {min_snr}dB 估算底噪")
             
-            while True:
-                # 准备容器
-                batch_X = []
-                batch_A = []
-                batch_y = []
-                
-                for _ in range(self.batch_size):
-                    # 随机决定是 H1 (有PU) 还是 H0 (噪声)
-                    label = 1 if np.random.rand() > 0.5 else 0
-                    
-                    if label == 1:
-                        # --- H1: 读硬盘 ---
-                        # 随机抽 225 个 QPSK 样本的索引
-                        sample_indices = np.random.choice(self.h1_indices, self.num_nodes, replace=False)
-                        sample_indices.sort() # h5py 要求索引必须排序
-                        
-                        # 【关键】只读取这 225 个样本
-                        raw_iq = X_ds[sample_indices]
-                        features = self._calculate_energy(raw_iq)
-                        
-                    else:
-                        # --- H0: 生成噪声 ---
-                        # 噪声方差根据数据集底噪调整，假设为 0.01
-                        noise = np.random.normal(0, np.sqrt(0.01/2), (self.num_nodes, 1024, 2))
-                        features = self._calculate_energy(noise)
-                    
-                    batch_X.append(features)
-                    batch_A.append(self.A_matrix)
-                    batch_y.append(label)
-                
-                # 转换为 Numpy 格式
-                # Keras 多输入格式: [X_input, A_input], label
-                yield [np.array(batch_X), np.array(batch_A)], np.array(batch_y)
+        # 只取前 2000 个样本计算 std，节省内存
+        idx_floor = noise_floor_indices[:2000]
+        # 需要重新从文件读取这部分纯底噪数据
+        X_floor = f['X'][idx_floor]
+        noise_std = np.std(X_floor)
+        print(f"📉 估计的物理底噪 Std: {noise_std:.6f}")
 
-# ==========================================
-# 2. 构建 GCN 模型 (基于论文 Table II)
-# ==========================================
-def build_model(num_nodes=225):
-    # 输入层: X (特征) 和 A (邻接矩阵)
-    X_in = Input(shape=(num_nodes, 1), name='X_input')
-    A_in = Input(shape=(num_nodes, num_nodes), name='A_input')
-
-    # 图卷积层
-    gc1 = GCNConv(32, activation='relu')([X_in, A_in])
-    gc2 = GCNConv(64, activation='relu')([gc1, A_in])
-    gc3 = GCNConv(128, activation='relu')([gc2, A_in])
-
-    # 图池化层
-    pool = GlobalSumPool()(gc3)
-
-    # 全连接层
-    fc1 = Dense(64, activation='relu')(pool)
-    output = Dense(2, activation='softmax')(fc1)
-
-    model = Model(inputs=[X_in, A_in], outputs=output)
-    optimizer = Adam(learning_rate=0.001)
-    model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-    return model
-
-# ==========================================
-# 3. 主程序
-# ==========================================
-if __name__ == "__main__":
-    # 替换你的 h5 文件路径
-    H5_FILE_PATH = 'GOLD_XYZ_OSC.0001_1024.hdf5' 
+    # 生成 H0 噪声
+    # 这里的噪声功率必须与数据集的底噪一致，模型才能正确区分
+    X_noise = np.random.normal(0, noise_std, size=X_sig.shape).astype(np.float32)
+    Z_noise = np.full((len(X_sig), 1), -100.0)
     
-    # 1. 实例化生成器
-    # 这一步只读取轻量级的索引，不会爆内存
-    data_gen = RadioGraphGenerator(H5_FILE_PATH, batch_size=32)
+    X = np.concatenate([X_noise, X_sig], axis=0)
+    Y = np.concatenate([np.zeros(len(X_sig)), np.ones(len(X_sig))])
+    Z = np.concatenate([Z_noise, Z_sig])
     
-    # 2. 构建模型
-    model = build_model(num_nodes=225)
-    model.summary()
+    # 【重要】删除了 Z-Score 归一化！
+    # 保持 X 的原始幅度，因为训练时并未归一化
     
-    # 3. 开始训练
-    # steps_per_epoch: 每一个 epoch 训练多少个 batch
-    # 这里的生成器是无限数据的，所以必须指定 steps_per_epoch
+    del X_chunks, X_sig, X_noise, Z_all, X_floor
+    gc.collect()
+    
+    print(f"✅ 数据就绪: {X.shape}")
+    return X, Y, Z.flatten()
+
+# ================= 批处理 =================
+def process_batch(X_raw, is_gcn=True):
+    feat_dim = 1024 * 2 // NUM_NODES
+    X_r = X_raw.reshape(-1, NUM_NODES, feat_dim)
+    X_t = tf.convert_to_tensor(X_r, dtype=tf.float32)
+    
+    if is_gcn:
+        # GCN 计算邻接矩阵
+        diff = tf.expand_dims(X_t, 2) - tf.expand_dims(X_t, 1)
+        dist = tf.reduce_sum(tf.square(diff), axis=-1)
+        A = tf.exp(-dist) 
+        D = tf.reduce_sum(A, axis=-1, keepdims=True)
+        A = A / (D + 1e-6)
+        return [X_t, A]
+    else:
+        # CNN/MLP 传 Dummy Tensor
+        batch_size = tf.shape(X_t)[0]
+        dummy = tf.zeros((batch_size, 1), dtype=tf.float32)
+        return [X_t, dummy]
+
+def get_predictions(model_cfg, X):
+    print(f"🤖 正在评估: {model_cfg['name']}...")
+    tf.keras.backend.clear_session()
+    gc.collect()
+    
+    model = model_cfg['class'](2, NUM_NODES)
     try:
-        print("开始训练...")
-        model.fit(
-            data_gen.generator(), 
-            steps_per_epoch=50,  # 测试用，正式训练可设为 1000+
-            epochs=5
-        )
-        print("训练完成！")
-    except KeyboardInterrupt:
-        print("训练手动停止")
+        model.build([(None, NUM_NODES, 64), (None, NUM_NODES, NUM_NODES)])
+        model.load_weights(model_cfg['path'])
+    except Exception as e:
+        print(f"❌ 权重加载失败: {e}")
+        return None
+        
+    preds = []
+    total = len(X)
+    is_gcn = (model_cfg['type'] == 'gcn')
+    
+    for i in range(0, total, BATCH_SIZE):
+        bx = X[i : i+BATCH_SIZE]
+        inputs = process_batch(bx, is_gcn=is_gcn)
+        p = model.predict_on_batch(inputs)
+        preds.append(p[:, 1])
+        
+        if i % (BATCH_SIZE * 50) == 0:
+            print(f"   进度: {i}/{total}", end='\r')
+            gc.collect()
+            
+    print(f"   进度: {total}/{total}")
+    return np.concatenate(preds)
+
+def plot_charts(results, Y_true, Z_snr):
+    # 图 1: Pd vs SNR
+    plt.figure(figsize=(10, 6))
+    snr_range = np.arange(-20, 31, 2)
+    
+    for name, scores in results.items():
+        cfg = next(c for c in MODELS if c['name'] == name)
+        
+        # 计算阈值
+        noise_scores = scores[Y_true == 0]
+        thresh = np.percentile(noise_scores, (1 - TARGET_PFA)*100)
+        
+        pd_list = []
+        for snr in snr_range:
+            idx = np.where((Y_true == 1) & (np.abs(Z_snr - snr) < 1.0))[0]
+            if len(idx) == 0: 
+                pd_list.append(0)
+            else:
+                pd = np.mean(scores[idx] > thresh)
+                pd_list.append(pd)
+            
+        plt.plot(snr_range, pd_list, label=name, color=cfg['color'], marker=cfg['marker'])
+                 
+    plt.title(f'Detection Probability vs SNR ($P_{{fa}}={TARGET_PFA}$)')
+    plt.xlabel('SNR (dB)')
+    plt.ylabel('Pd')
+    plt.xlim([-20, 30])
+    plt.ylim([0, 1.05])
+    plt.grid(True)
+    plt.legend()
+    plt.savefig('real_pd_vs_snr_fixed.png')
+    print("✅ 图1 保存成功: real_pd_vs_snr_fixed.png")
+
+    # 图 2: ROC
+    plt.figure(figsize=(8, 8))
+    target_snr = -10
+    sig_idx = np.where((Y_true == 1) & (np.abs(Z_snr - target_snr) < 1.0))[0]
+    noise_idx = np.where(Y_true == 0)[0]
+    
+    if len(sig_idx) > 0:
+        y_roc = np.concatenate([np.zeros(len(noise_idx)), np.ones(len(sig_idx))])
+        for name, scores in results.items():
+            cfg = next(c for c in MODELS if c['name'] == name)
+            s_roc = np.concatenate([scores[noise_idx], scores[sig_idx]])
+            fpr, tpr, _ = roc_curve(y_roc, s_roc)
+            plt.plot(fpr, tpr, label=f"{name} (AUC={auc(fpr, tpr):.4f})", color=cfg['color'])
+            
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.title(f'ROC at {target_snr}dB')
+    plt.legend()
+    plt.savefig('real_roc_curve_fixed.png')
+    print("✅ 图2 保存成功: real_roc_curve_fixed.png")
+
+if __name__ == "__main__":
+    X, Y, Z = load_random_test_data(HDF5_PATH, samples_per_snr=SAMPLES_PER_SNR)
+    
+    results = {}
+    for m in MODELS:
+        s = get_predictions(m, X)
+        if s is not None: results[m['name']] = s
+            
+    if results: plot_charts(results, Y, Z)

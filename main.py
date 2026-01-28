@@ -1,19 +1,10 @@
 import os
 import argparse
-
-# ---【新增】强制禁用 cuDNN 自动调优，解决 DNN library initialization failed ---
-os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
-os.environ['TF_CUDNN_USE_AUTOTUNE'] = '0'
-# -----------------------------------------------------------------------
-
-# 1. 先导入 TensorFlow
-import tensorflow as tf
 import tensorflow as tf
 
 # ==========================================
-# 2. 显存配置 (必须在导入 model/dataset 之前执行！)
+# 1. 显存配置
 # ==========================================
-# 强制设置环境变量
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -29,18 +20,19 @@ else:
     print("⚠️ 未检测到 GPU，将使用 CPU 运行。")
 
 # ==========================================
-# 3. 再导入自定义模块 (dataset, model, training)
+# 2. 导入自定义模块
 # ==========================================
-# 只有在上面配置完成后，才允许加载这些文件
-from dataset import get_generators
-from model import GCN_CSS
+# 【关键修复】这里必须包含 get_generators
+from dataset import get_generators 
+from model import GCN_CSS, CNN_CSS, MLP_CSS 
 from training import train_model
 
 def main():
-    parser = argparse.ArgumentParser(description="GCN-CSS for RadioML")
+    parser = argparse.ArgumentParser(description="GCN/CNN/MLP Spectrum Sensing")
     parser.add_argument('--path', type=str, required=True, help='Path to .hdf5 dataset')
+    # 支持模型选择
+    parser.add_argument('--model_type', type=str, default='gcn', choices=['gcn', 'cnn', 'mlp'], help='Choose model architecture')
     parser.add_argument('--epochs', type=int, default=10)
-    # 如果显存依然报错，尝试降低 batch_size 到 16 或 8
     parser.add_argument('--batch_size', type=int, default=32) 
     parser.add_argument('--nodes', type=int, default=32)
     parser.add_argument('--lr', type=float, default=0.001)
@@ -48,7 +40,7 @@ def main():
     
     args = parser.parse_args()
     
-    print(f"正在准备数据生成器 (Nodes={args.nodes})...")
+    print(f"🚀 正在准备数据生成器 (Nodes={args.nodes})...")
     
     # 获取生成器
     train_gen, val_gen, num_classes, num_features = get_generators(
@@ -61,15 +53,29 @@ def main():
     
     print(f"生成器准备完毕。分类数: {num_classes}, 节点特征维数: {num_features}")
     
-    # 初始化模型
-    model = GCN_CSS(num_classes=num_classes, num_nodes=args.nodes)
+    # 根据参数选择模型和保存路径
+    if args.model_type == 'gcn':
+        print("构建 GCN 模型...")
+        model = GCN_CSS(num_classes=num_classes, num_nodes=args.nodes)
+        save_name = 'best_gcn_model.h5'
+    elif args.model_type == 'cnn':
+        print("构建 CNN 模型...")
+        model = CNN_CSS(num_classes=num_classes, num_nodes=args.nodes)
+        save_name = 'best_cnn_model.h5'
+    elif args.model_type == 'mlp':
+        print("构建 MLP 模型...")
+        model = MLP_CSS(num_classes=num_classes, num_nodes=args.nodes)
+        save_name = 'best_mlp_model.h5'
     
-    # Build模型
+    # Build 模型
+    # 注意：GCN 需要两个输入 [(Batch, Nodes, Feats), (Batch, Nodes, Nodes)]
+    # CNN/MLP 虽然只用 Feats，但为了接口统一，这里 Build 形状保持一致即可
     model.build([(None, args.nodes, num_features), (None, args.nodes, args.nodes)])
     model.summary()
     
     # 开始训练
-    train_model(model, train_gen, val_gen, epochs=args.epochs, lr=args.lr)
+    # 注意：请确保你的 training.py 已经按照上一步修改，支持 save_path 参数
+    train_model(model, train_gen, val_gen, epochs=args.epochs, lr=args.lr, save_path=save_name)
 
 if __name__ == "__main__":
     main()
