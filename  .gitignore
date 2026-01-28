@@ -1,0 +1,23 @@
+# 排除大型数据集
+GOLD_XYZ_OSC.0001_1024.hdf5
+*.hdf5
+*.csv
+*.npy
+
+# 排除 Python 自动生成的缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 排除深度学习权重和日志
+*.pth
+*.pt
+*.ckpt
+logs/
+checkpoints/
+
+# 排除虚拟环境和系统文件
+.venv/
+venv/
+.DS_Store
+.ipynb_checkpoints/
