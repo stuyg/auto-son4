@@ -1,12 +1,15 @@
 import os
 import argparse
-import tensorflow as tf
 
 # ==========================================
-# 1. 显存配置
+# 1. 显存配置 (务必放在 import tensorflow 之前)
 # ==========================================
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import tensorflow as tf  # <--- 移到这里
+
+
 
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
