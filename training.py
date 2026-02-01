@@ -1,16 +1,13 @@
-# 修改文件: stuyg/auto-son2/.../training.py
-
 import tensorflow as tf
 import os
 
-# 修改函数签名，增加 save_path 参数
 def train_model(model, train_ds, val_ds, epochs=10, lr=0.001, save_path='best_model.h5'):
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
     loss_fn = tf.keras.losses.CategoricalCrossentropy()
     
     model.compile(optimizer=optimizer, loss=loss_fn, metrics=['accuracy'])
     
-    # 使用传入的 save_path
+    # 使用传入的 save_path 保存最佳权重
     checkpoint = tf.keras.callbacks.ModelCheckpoint(
         save_path, 
         monitor='val_accuracy', 

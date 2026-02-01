@@ -52,17 +52,14 @@ class RadioMLSequence(tf.keras.utils.Sequence):
         file_indices = self.indices[batch_idx_in_indices]
         sorted_file_indices = np.sort(file_indices)
         
-        # 惰性加载：只读取当前 batch
         with h5py.File(self.hdf5_path, 'r') as f:
             X_batch = f['X'][sorted_file_indices]
             Z_batch = f['Z'][sorted_file_indices]
-            
             if self.mode != 'binary':
                 Y_original = f['Y'][sorted_file_indices]
             else:
                 Y_original = None
 
-        # 转为 NumPy float32
         X_batch = X_batch.astype(np.float32)
 
         if self.mode == 'binary':
@@ -71,7 +68,6 @@ class RadioMLSequence(tf.keras.utils.Sequence):
             
             noise_count = current_batch_size // 2
             if noise_count > 0:
-                # 生成噪声
                 noise_data = np.random.normal(0, self.noise_std, size=(noise_count, 1024, 2)).astype(np.float32)
                 X_batch[-noise_count:] = noise_data
                 Y_new[-noise_count:, 0] = 1.0
@@ -82,16 +78,27 @@ class RadioMLSequence(tf.keras.utils.Sequence):
             Y_batch = Y_original
 
         # ==========================================
-        # 纯 NumPy 矩阵计算 (修复 GPU 冲突)
+        # 优化点：对称归一化 (Symmetric Normalization)
         # ==========================================
         X_reshaped = X_batch.reshape(-1, self.num_nodes, self.feature_dim)
         
-        # 计算邻接矩阵 (NumPy)
+        # 计算欧氏距离
         diff = np.expand_dims(X_reshaped, 2) - np.expand_dims(X_reshaped, 1)
         dist_sq = np.sum(np.square(diff), axis=-1)
+        
+        # 建议：减小 sigma 以稀疏化图 (例如 sigma=0.5)
+        # 如果你想在这里硬编码，可以改为 self.sigma ** 2 (假设外部传入了0.5)
         A_batch = np.exp(-dist_sq / (self.sigma ** 2))
+        
+        # 对称归一化: D^-0.5 * A * D^-0.5
         D = np.sum(A_batch, axis=-1, keepdims=True)
-        A_batch_norm = A_batch / (D + 1e-6)
+        # 防止除零
+        D_inv_sqrt = np.power(D + 1e-6, -0.5) 
+        
+        # 利用广播: (N, 1) * (N, N) * (1, N)
+        # 注意 numpy 广播规则，D_inv_sqrt 需要转置乘在右边
+        # formula: D_inv_sqrt * A * Transpose(D_inv_sqrt)
+        A_batch_norm = D_inv_sqrt * A_batch * np.transpose(D_inv_sqrt, (0, 2, 1))
 
         return [X_reshaped, A_batch_norm.astype(np.float32)], Y_batch
 
